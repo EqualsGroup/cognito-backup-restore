@@ -75,11 +75,12 @@ export const restoreUsers = async (cognito: CognitoISP, UserPoolId: string, file
     const { UserPool } = await cognito.describeUserPool({ UserPoolId }).promise();
     const UsernameAttributes = UserPool && UserPool.UsernameAttributes || [];
 
-    const limiter = new Bottleneck({ minTime: 2000 });
+    const limiter = new Bottleneck({ minTime: 300 });
     const readStream = fs.createReadStream(file);
     const parser = JSONStream.parse();
 
     parser.on('data', async (data: any[]) => {
+        const sqlWriteStream = fs.createWriteStream('identifiers.sql');
         for (let user of data) {
             // filter out non-mutable attributes
             const attributes = user.Attributes.filter((attr: AttributeType) => attr.Name !== 'sub');
@@ -119,7 +120,32 @@ export const restoreUsers = async (cognito: CognitoISP, UserPoolId: string, file
             }
             const wrapped = limiter.wrap(async () => cognito.adminCreateUser(params).promise());
             try {
-               await wrapped();
+              const response = await wrapped();
+              if (response.User === undefined || response.User.Username === undefined) {
+                throw `Bad response from adminCreateUser: ${response}`;
+              }
+              const newSub = pluckValue(response.User?.Attributes || [], 'sub');
+              const oldSub = pluckValue(user.Attributes, 'sub');
+              if (newSub !== oldSub) {
+                console.log(`${user.Username}: sub changed from ${oldSub} → ${newSub}`);
+                const sql = `UPDATE identifiers SET identifier = '${newSub}' WHERE identifier = '${oldSub}';\n`
+                sqlWriteStream.write(sql);
+              }
+              if (params.TemporaryPassword && user.UserStatus === 'CONFIRMED') {
+                console.log(`Setting password to ${params.TemporaryPassword}`);
+                await cognito.adminSetUserPassword({
+                  Password: params.TemporaryPassword,
+                  Username: response.User.Username,
+                  Permanent: true,
+                  UserPoolId
+                }).promise();
+              }
+              if (!user.Enabled) {
+                await cognito.adminDisableUser({
+                  Username: response.User.Username,
+                  UserPoolId
+                }).promise();
+              }
             } catch (e) {
               if (e.code === 'UsernameExistsException') {
                   console.log(`Looks like user ${user.Username} already exists, ignoring.`)
